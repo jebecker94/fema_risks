@@ -1,93 +1,142 @@
-# Import required libraries
-import polars as pl
+"""Explore FEMA policy rate changes by policy year."""
+
+from __future__ import annotations
+
+import datetime as dt
 from pathlib import Path
-import datetime
+from typing import Iterable, Tuple
+
 import matplotlib.pyplot as plt
+import polars as pl
 
-# Set directories
-data_dir = Path(__file__).parent.parent / "Data"
-figures_dir = Path(__file__).parent.parent / "Figures"
 
-# Create directories if they don't exist
-figures_dir.mkdir(parents=True, exist_ok=True)
-data_dir.mkdir(parents=True, exist_ok=True)
+def prepare_directories(base_path: Path) -> Tuple[Path, Path]:
+    """Create and return the data and figure directories for the project."""
 
-# Set state
-state = 'FL'
+    data_dir = base_path / "Data"
+    figures_dir = base_path / "Figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir, figures_dir
 
-# Load data
-csv_file = data_dir / "FimaNfipPoliciesV2.parquet"
-df = pl.scan_parquet(csv_file)
 
-# Create year and month
-df = df.with_columns(
-    pl.col('policyEffectiveDate').dt.year().alias('Year'),
-    pl.col('policyEffectiveDate').dt.month().alias('Month')
-)
+def load_policy_frame(data_dir: Path) -> pl.LazyFrame:
+    """Load the FEMA policy dataset as a lazy Polars frame."""
 
-# Filter Data
-df = df.filter(
-    (pl.col('Year') >= 2021),
-    (pl.col('Month') > 3) | (pl.col('Year') > 2021),
-    (pl.col('propertyState').is_in(['FL'])),
-    (pl.col('occupancyType').is_in([1,11])),
-    (pl.col('censusTract') != ""),
-    (pl.col('ratedFloodZone') != ""),
-    (pl.col('originalNBDate').dt.year() < 2021) | (pl.col('originalNBDate').dt.month() < 4)
-)
+    return pl.scan_parquet(data_dir / "FimaNfipPoliciesV2.parquet")
 
-# Years since march 2021
-df = df.with_columns(
-    (pl.col('policyEffectiveDate') - datetime.datetime(2021, 3, 1)).dt.total_days().alias('DaysSinceMarch2021'),
-)
-df = df.with_columns(
-    (pl.col('DaysSinceMarch2021') / 365).floor().alias('YearsSinceMarch2021'),
-)
 
-# Collect data
-df = df.collect()
+def preprocess_policies(lazy_frame: pl.LazyFrame, state: str) -> pl.DataFrame:
+    """Filter and engineer features needed for rate change exploration."""
 
-# Merge years 0 and 1
-df0 = df.filter(pl.col('YearsSinceMarch2021') == 0).select(['censusTract','originalNBDate','policyCost'])
-df1 = df.filter(pl.col('YearsSinceMarch2021') == 1).select(['censusTract','originalNBDate','policyCost'])
-df01 = df0.join(df1, on=['censusTract','originalNBDate'], how='inner', suffix='_01')
-df01 = df01.with_columns(
-    (pl.col('policyCost_01') - pl.col('policyCost')).alias('PolicyCostChange'),
-    ((pl.col('policyCost_01') - pl.col('policyCost')) / pl.col('policyCost')).alias('PolicyCostChangePercent')
-)
-
-# Truncate change percent at 200%
-df01 = df01.with_columns(
-    pl.when(pl.col('PolicyCostChangePercent') > 2)
-    .then(2)
-    .otherwise(pl.col('PolicyCostChangePercent'))
-    .alias('PolicyCostChangePercent')
-)
-
-# Plot histogram of policy cost changes
-fig = plt.figure(figsize=(10, 5))
-plt.hist(df01['PolicyCostChangePercent'], bins=100)
-plt.show()
-
-# Plot increases for policy years 1-4
-for policy_year in range(1, 5):
-    df_original = df.filter(pl.col('YearsSinceMarch2021') == 0).select(['censusTract','originalNBDate','policyCost'])
-    df_new = df.filter(pl.col('YearsSinceMarch2021') == policy_year).select(['censusTract','originalNBDate','policyCost'])
-    df_change = df_original.join(df_new, on=['censusTract','originalNBDate'], how='inner', suffix=f'_year_{policy_year}')
-    df_change = df_change.with_columns(
-        (pl.col(f'policyCost_year_{policy_year}') - pl.col('policyCost')).alias(f'PolicyCostChange_year_{policy_year}'),
-        ((pl.col(f'policyCost_year_{policy_year}') - pl.col('policyCost')) / pl.col('policyCost')).alias(f'PolicyCostChangePercent_year_{policy_year}')
+    return (
+        lazy_frame.with_columns(
+            pl.col("policyEffectiveDate").dt.year().alias("Year"),
+            pl.col("policyEffectiveDate").dt.month().alias("Month"),
+        )
+        .filter(
+            (pl.col("Year") >= 2021),
+            (pl.col("Month") > 3) | (pl.col("Year") > 2021),
+            (pl.col("propertyState").is_in([state])),
+            (pl.col("occupancyType").is_in([1, 11])),
+            (pl.col("censusTract") != ""),
+            (pl.col("ratedFloodZone") != ""),
+            (pl.col("originalNBDate").dt.year() < 2021)
+            | (pl.col("originalNBDate").dt.month() < 4),
+        )
+        .with_columns(
+            (pl.col("policyEffectiveDate") - dt.datetime(2021, 3, 1))
+            .dt.total_days()
+            .alias("DaysSinceMarch2021"),
+        )
+        .with_columns(
+            (pl.col("DaysSinceMarch2021") / 365).floor().alias("YearsSinceMarch2021"),
+        )
+        .collect()
     )
-    df_change = df_change.with_columns(
-        pl.when(pl.col(f'PolicyCostChangePercent_year_{policy_year}') > 2)
-        .then(2)
-        .otherwise(pl.col(f'PolicyCostChangePercent_year_{policy_year}'))
-        .alias(f'PolicyCostChangePercent_year_{policy_year}')
+
+
+def compute_policy_cost_changes(df: pl.DataFrame, policy_year: int) -> pl.DataFrame:
+    """Compute policy cost changes between year zero and a specified policy year."""
+
+    df_original = df.filter(pl.col("YearsSinceMarch2021") == 0).select(
+        ["censusTract", "originalNBDate", "policyCost"]
     )
+    df_new = df.filter(pl.col("YearsSinceMarch2021") == policy_year).select(
+        ["censusTract", "originalNBDate", "policyCost"]
+    )
+    joined = df_original.join(
+        df_new,
+        on=["censusTract", "originalNBDate"],
+        how="inner",
+        suffix=f"_year_{policy_year}",
+    )
+    return (
+        joined.with_columns(
+            (
+                pl.col(f"policyCost_year_{policy_year}") - pl.col("policyCost")
+            ).alias(f"PolicyCostChange_year_{policy_year}"),
+            (
+                (
+                    pl.col(f"policyCost_year_{policy_year}")
+                    - pl.col("policyCost")
+                )
+                / pl.col("policyCost")
+            ).alias(f"PolicyCostChangePercent_year_{policy_year}"),
+        )
+        .with_columns(
+            pl.when(pl.col(f"PolicyCostChangePercent_year_{policy_year}") > 2)
+            .then(2)
+            .otherwise(pl.col(f"PolicyCostChangePercent_year_{policy_year}"))
+            .alias(f"PolicyCostChangePercent_year_{policy_year}"),
+        )
+    )
+
+
+def plot_histogram(series: pl.Series, title: str, bins: int, output_path: Path | None = None) -> None:
+    """Plot a histogram for the provided Polars series."""
+
     fig = plt.figure(figsize=(10, 5))
-    plt.hist(df_change[f'PolicyCostChangePercent_year_{policy_year}'], bins=100)
-    plt.title(f'Policy Cost Change Percent for Policy Year {policy_year}')
-    plt.xlabel('Policy Cost Change Percent')
-    plt.ylabel('Frequency')
-    plt.savefig(figures_dir / f'{state}_policy_cost_change_percent_year_{policy_year}.png')
+    plt.hist(series.to_numpy(), bins=bins)
+    plt.title(title)
+    plt.xlabel("Policy Cost Change Percent")
+    plt.ylabel("Frequency")
+    if output_path is not None:
+        plt.savefig(output_path)
     plt.show()
+    plt.close(fig)
+
+
+def explore_rate_changes(state: str, policy_years: Iterable[int]) -> None:
+    """Explore rate changes and create histograms for the requested policy years."""
+
+    base_path = Path(__file__).parent.parent
+    data_dir, figures_dir = prepare_directories(base_path)
+    df = preprocess_policies(load_policy_frame(data_dir), state)
+
+    first_year_changes = compute_policy_cost_changes(df, 1)
+    plot_histogram(
+        first_year_changes["PolicyCostChangePercent_year_1"],
+        "Policy Cost Change Percent",
+        bins=100,
+    )
+
+    for policy_year in policy_years:
+        change_df = compute_policy_cost_changes(df, policy_year)
+        plot_histogram(
+            change_df[f"PolicyCostChangePercent_year_{policy_year}"],
+            f"Policy Cost Change Percent for Policy Year {policy_year}",
+            bins=100,
+            output_path=figures_dir
+            / f"{state}_policy_cost_change_percent_year_{policy_year}.png",
+        )
+
+
+def main() -> None:
+    """Execute the full rate change exploration workflow for Florida policies."""
+
+    explore_rate_changes("FL", policy_years=range(1, 5))
+
+
+if __name__ == "__main__":
+    main()
